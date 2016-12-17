@@ -197,13 +197,13 @@ struct audit_chunk *audit_tree_lookup(const struct inode *inode)
 	return NULL;
 }
 
-int audit_tree_match(struct audit_chunk *chunk, struct audit_tree *tree)
+bool audit_tree_match(struct audit_chunk *chunk, struct audit_tree *tree)
 {
 	int n;
 	for (n = 0; n < chunk->count; n++)
 		if (chunk->owners[n].owner == tree)
-			return 1;
-	return 0;
+			return true;
+	return false;
 }
 
 /* tagging and untagging inodes with trees */
@@ -458,8 +458,7 @@ static void audit_tree_log_remove_rule(struct audit_krule *rule)
 	ab = audit_log_start(NULL, GFP_KERNEL, AUDIT_CONFIG_CHANGE);
 	if (unlikely(!ab))
 		return;
-	audit_log_format(ab, "op=");
-	audit_log_string(ab, "remove_rule");
+	audit_log_format(ab, "op=remove_rule");
 	audit_log_format(ab, " dir=");
 	audit_log_untrustedstring(ab, rule->tree->pathname);
 	audit_log_key(ab, rule->filterkey);
@@ -479,6 +478,8 @@ static void kill_rules(struct audit_tree *tree)
 		if (rule->tree) {
 			/* not a half-baked one */
 			audit_tree_log_remove_rule(rule);
+			if (entry->rule.exe)
+				audit_remove_mark(entry->rule.exe);
 			rule->tree = NULL;
 			list_del_rcu(&entry->list);
 			list_del(&entry->rule.list);
@@ -659,10 +660,10 @@ static int tag_mount(struct vfsmount *mnt, void *arg)
 static int prune_tree_thread(void *unused)
 {
 	for (;;) {
-		set_current_state(TASK_INTERRUPTIBLE);
-		if (list_empty(&prune_list))
+		if (list_empty(&prune_list)) {
+			set_current_state(TASK_INTERRUPTIBLE);
 			schedule();
-		__set_current_state(TASK_RUNNING);
+		}
 
 		mutex_lock(&audit_cmd_mutex);
 		mutex_lock(&audit_filter_mutex);
@@ -691,16 +692,14 @@ static int audit_launch_prune(void)
 {
 	if (prune_thread)
 		return 0;
-	prune_thread = kthread_create(prune_tree_thread, NULL,
+	prune_thread = kthread_run(prune_tree_thread, NULL,
 				"audit_prune_tree");
 	if (IS_ERR(prune_thread)) {
 		pr_err("cannot start thread audit_prune_tree");
 		prune_thread = NULL;
 		return -ENOMEM;
-	} else {
-		wake_up_process(prune_thread);
-		return 0;
 	}
+	return 0;
 }
 
 /* called with audit_filter_mutex */

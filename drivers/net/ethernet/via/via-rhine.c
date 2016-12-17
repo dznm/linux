@@ -890,7 +890,6 @@ static const struct net_device_ops rhine_netdev_ops = {
 	.ndo_start_xmit		 = rhine_start_tx,
 	.ndo_get_stats64	 = rhine_get_stats64,
 	.ndo_set_rx_mode	 = rhine_set_rx_mode,
-	.ndo_change_mtu		 = eth_change_mtu,
 	.ndo_validate_addr	 = eth_validate_addr,
 	.ndo_set_mac_address 	 = eth_mac_addr,
 	.ndo_do_ioctl		 = netdev_ioctl,
@@ -1758,7 +1757,7 @@ static void rhine_reset_task(struct work_struct *work)
 
 	spin_unlock_bh(&rp->lock);
 
-	dev->trans_start = jiffies; /* prevent tx timeout */
+	netif_trans_update(dev); /* prevent tx timeout */
 	dev->stats.tx_errors++;
 	netif_wake_queue(dev);
 
@@ -2134,9 +2133,10 @@ static int rhine_rx(struct net_device *dev, int limit)
 			}
 
 			skb_put(skb, pkt_len);
-			skb->protocol = eth_type_trans(skb, dev);
 
 			rhine_rx_vlan_tag(skb, desc, data_size);
+
+			skb->protocol = eth_type_trans(skb, dev);
 
 			netif_receive_skb(skb);
 

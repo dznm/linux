@@ -36,11 +36,11 @@
 #include <linux/linkage.h>
 #include <linux/interrupt.h>
 #include <linux/irq.h>
-#include <linux/module.h>
 #include <linux/smp.h>
 #include <linux/percpu.h>
 #include <linux/cpu.h>
 
+#include <asm/barrier.h>
 #include <asm/sync_bitops.h>
 #include <asm/xen/hypercall.h>
 #include <asm/xen/hypervisor.h>
@@ -54,7 +54,7 @@
 
 #include "events_internal.h"
 
-#define EVENT_WORDS_PER_PAGE (PAGE_SIZE / sizeof(event_word_t))
+#define EVENT_WORDS_PER_PAGE (XEN_PAGE_SIZE / sizeof(event_word_t))
 #define MAX_EVENT_ARRAY_PAGES (EVTCHN_FIFO_NR_CHANNELS / EVENT_WORDS_PER_PAGE)
 
 struct evtchn_fifo_queue {
@@ -111,9 +111,9 @@ static int init_control_block(int cpu,
 	for (i = 0; i < EVTCHN_FIFO_MAX_QUEUES; i++)
 		q->head[i] = 0;
 
-	init_control.control_gfn = virt_to_mfn(control_block);
+	init_control.control_gfn = virt_to_gfn(control_block);
 	init_control.offset      = 0;
-	init_control.vcpu        = cpu;
+	init_control.vcpu        = xen_vcpu_nr(cpu);
 
 	return HYPERVISOR_event_channel_op(EVTCHNOP_init_control, &init_control);
 }
@@ -167,7 +167,7 @@ static int evtchn_fifo_setup(struct irq_info *info)
 		/* Mask all events in this page before adding it. */
 		init_array_page(array_page);
 
-		expand_array.array_gfn = virt_to_mfn(array_page);
+		expand_array.array_gfn = virt_to_gfn(array_page);
 
 		ret = HYPERVISOR_event_channel_op(EVTCHNOP_expand_array, &expand_array);
 		if (ret < 0)
@@ -255,12 +255,6 @@ static void evtchn_fifo_unmask(unsigned port)
 	}
 }
 
-static bool evtchn_fifo_is_linked(unsigned port)
-{
-	event_word_t *word = event_word_from_port(port);
-	return sync_test_bit(EVTCHN_FIFO_BIT(LINKED, word), BM(word));
-}
-
 static uint32_t clear_linked(volatile event_word_t *word)
 {
 	event_word_t new, old, w;
@@ -302,7 +296,7 @@ static void consume_one_event(unsigned cpu,
 	 * control block.
 	 */
 	if (head == 0) {
-		rmb(); /* Ensure word is up-to-date before reading head. */
+		virt_rmb(); /* Ensure word is up-to-date before reading head. */
 		head = control_block->head[priority];
 	}
 
@@ -321,7 +315,9 @@ static void consume_one_event(unsigned cpu,
 		clear_bit(priority, ready);
 
 	if (evtchn_fifo_is_pending(port) && !evtchn_fifo_is_masked(port)) {
-		if (likely(!drop))
+		if (unlikely(drop))
+			pr_warn("Dropping pending event for port %u\n", port);
+		else
 			handle_irq_for_port(port);
 	}
 
@@ -385,26 +381,6 @@ static void evtchn_fifo_resume(void)
 	event_array_pages = 0;
 }
 
-static void evtchn_fifo_close(unsigned port, unsigned int cpu)
-{
-	if (cpu == NR_CPUS)
-		return;
-
-	get_online_cpus();
-	if (cpu_online(cpu)) {
-		if (WARN_ON(irqs_disabled()))
-			goto out;
-
-		while (evtchn_fifo_is_linked(port))
-			cpu_relax();
-	} else {
-		__evtchn_fifo_handle_events(cpu, true);
-	}
-
-out:
-	put_online_cpus();
-}
-
 static const struct evtchn_ops evtchn_ops_fifo = {
 	.max_channels      = evtchn_fifo_max_channels,
 	.nr_channels       = evtchn_fifo_nr_channels,
@@ -418,7 +394,6 @@ static const struct evtchn_ops evtchn_ops_fifo = {
 	.unmask            = evtchn_fifo_unmask,
 	.handle_events     = evtchn_fifo_handle_events,
 	.resume            = evtchn_fifo_resume,
-	.close             = evtchn_fifo_close,
 };
 
 static int evtchn_fifo_alloc_control_block(unsigned cpu)
@@ -443,27 +418,18 @@ static int evtchn_fifo_alloc_control_block(unsigned cpu)
 	return ret;
 }
 
-static int evtchn_fifo_cpu_notification(struct notifier_block *self,
-						  unsigned long action,
-						  void *hcpu)
+static int xen_evtchn_cpu_prepare(unsigned int cpu)
 {
-	int cpu = (long)hcpu;
-	int ret = 0;
-
-	switch (action) {
-	case CPU_UP_PREPARE:
-		if (!per_cpu(cpu_control_block, cpu))
-			ret = evtchn_fifo_alloc_control_block(cpu);
-		break;
-	default:
-		break;
-	}
-	return ret < 0 ? NOTIFY_BAD : NOTIFY_OK;
+	if (!per_cpu(cpu_control_block, cpu))
+		return evtchn_fifo_alloc_control_block(cpu);
+	return 0;
 }
 
-static struct notifier_block evtchn_fifo_cpu_notifier = {
-	.notifier_call	= evtchn_fifo_cpu_notification,
-};
+static int xen_evtchn_cpu_dead(unsigned int cpu)
+{
+	__evtchn_fifo_handle_events(cpu, true);
+	return 0;
+}
 
 int __init xen_evtchn_fifo_init(void)
 {
@@ -478,7 +444,9 @@ int __init xen_evtchn_fifo_init(void)
 
 	evtchn_ops = &evtchn_ops_fifo;
 
-	register_cpu_notifier(&evtchn_fifo_cpu_notifier);
+	cpuhp_setup_state_nocalls(CPUHP_XEN_EVTCHN_PREPARE,
+				  "CPUHP_XEN_EVTCHN_PREPARE",
+				  xen_evtchn_cpu_prepare, xen_evtchn_cpu_dead);
 out:
 	put_cpu();
 	return ret;

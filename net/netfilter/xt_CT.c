@@ -143,7 +143,7 @@ xt_ct_set_timeout(struct nf_conn *ct, const struct xt_tgchk_param *par,
 		goto out;
 	}
 
-	timeout = timeout_find_get(timeout_name);
+	timeout = timeout_find_get(par->net, timeout_name);
 	if (timeout == NULL) {
 		ret = -ENOENT;
 		pr_info("No such timeout policy \"%s\"\n", timeout_name);
@@ -171,6 +171,9 @@ xt_ct_set_timeout(struct nf_conn *ct, const struct xt_tgchk_param *par,
 	if (timeout_ext == NULL)
 		ret = -ENOMEM;
 
+	rcu_read_unlock();
+	return ret;
+
 err_put_timeout:
 	__xt_ct_tg_timeout_put(timeout);
 out:
@@ -181,9 +184,23 @@ out:
 #endif
 }
 
+static u16 xt_ct_flags_to_dir(const struct xt_ct_target_info_v1 *info)
+{
+	switch (info->flags & (XT_CT_ZONE_DIR_ORIG |
+			       XT_CT_ZONE_DIR_REPL)) {
+	case XT_CT_ZONE_DIR_ORIG:
+		return NF_CT_ZONE_DIR_ORIG;
+	case XT_CT_ZONE_DIR_REPL:
+		return NF_CT_ZONE_DIR_REPL;
+	default:
+		return NF_CT_DEFAULT_ZONE_DIR;
+	}
+}
+
 static int xt_ct_tg_check(const struct xt_tgchk_param *par,
 			  struct xt_ct_target_info_v1 *info)
 {
+	struct nf_conntrack_zone zone;
 	struct nf_conn *ct;
 	int ret = -EOPNOTSUPP;
 
@@ -193,18 +210,27 @@ static int xt_ct_tg_check(const struct xt_tgchk_param *par,
 	}
 
 #ifndef CONFIG_NF_CONNTRACK_ZONES
-	if (info->zone)
+	if (info->zone || info->flags & (XT_CT_ZONE_DIR_ORIG |
+					 XT_CT_ZONE_DIR_REPL |
+					 XT_CT_ZONE_MARK))
 		goto err1;
 #endif
 
-	ret = nf_ct_l3proto_try_module_get(par->family);
+	ret = nf_ct_netns_get(par->net, par->family);
 	if (ret < 0)
 		goto err1;
 
-	ct = nf_ct_tmpl_alloc(par->net, info->zone, GFP_KERNEL);
-	ret = PTR_ERR(ct);
-	if (IS_ERR(ct))
+	memset(&zone, 0, sizeof(zone));
+	zone.id = info->zone;
+	zone.dir = xt_ct_flags_to_dir(info);
+	if (info->flags & XT_CT_ZONE_MARK)
+		zone.flags |= NF_CT_FLAG_MARK;
+
+	ct = nf_ct_tmpl_alloc(par->net, &zone, GFP_KERNEL);
+	if (!ct) {
+		ret = -ENOMEM;
 		goto err2;
+	}
 
 	ret = 0;
 	if ((info->ct_events || info->exp_events) &&
@@ -232,9 +258,9 @@ out:
 	return 0;
 
 err3:
-	nf_conntrack_free(ct);
+	nf_ct_tmpl_free(ct);
 err2:
-	nf_ct_l3proto_module_put(par->family);
+	nf_ct_netns_put(par->net, par->family);
 err1:
 	return ret;
 }
@@ -295,8 +321,10 @@ static void xt_ct_destroy_timeout(struct nf_conn *ct)
 
 	if (timeout_put) {
 		timeout_ext = nf_ct_timeout_find(ct);
-		if (timeout_ext)
+		if (timeout_ext) {
 			timeout_put(timeout_ext->timeout);
+			RCU_INIT_POINTER(timeout_ext->timeout, NULL);
+		}
 	}
 	rcu_read_unlock();
 #endif
@@ -313,7 +341,7 @@ static void xt_ct_tg_destroy(const struct xt_tgdtor_param *par,
 		if (help)
 			module_put(help->helper->me);
 
-		nf_ct_l3proto_module_put(par->family);
+		nf_ct_netns_put(par->net, par->family);
 
 		xt_ct_destroy_timeout(ct);
 		nf_ct_put(info->ct);

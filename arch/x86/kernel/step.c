@@ -18,6 +18,7 @@ unsigned long convert_ip_to_linear(struct task_struct *child, struct pt_regs *re
 		return addr;
 	}
 
+#ifdef CONFIG_MODIFY_LDT_SYSCALL
 	/*
 	 * We'll assume that the code segments in the GDT
 	 * are all zero-based. That is largely true: the
@@ -28,11 +29,11 @@ unsigned long convert_ip_to_linear(struct task_struct *child, struct pt_regs *re
 		struct desc_struct *desc;
 		unsigned long base;
 
-		seg &= ~7UL;
+		seg >>= 3;
 
 		mutex_lock(&child->mm->context.lock);
 		if (unlikely(!child->mm->context.ldt ||
-			     (seg >> 3) >= child->mm->context.ldt->size))
+			     seg >= child->mm->context.ldt->size))
 			addr = -1L; /* bogus selector, access would fault */
 		else {
 			desc = &child->mm->context.ldt->entries[seg];
@@ -45,6 +46,7 @@ unsigned long convert_ip_to_linear(struct task_struct *child, struct pt_regs *re
 		}
 		mutex_unlock(&child->mm->context.lock);
 	}
+#endif
 
 	return addr;
 }
@@ -55,7 +57,8 @@ static int is_setting_trap_flag(struct task_struct *child, struct pt_regs *regs)
 	unsigned char opcode[15];
 	unsigned long addr = convert_ip_to_linear(child, regs);
 
-	copied = access_process_vm(child, addr, opcode, sizeof(opcode), 0);
+	copied = access_process_vm(child, addr, opcode, sizeof(opcode),
+			FOLL_FORCE);
 	for (i = 0; i < copied; i++) {
 		switch (opcode[i]) {
 		/* popf and iret */

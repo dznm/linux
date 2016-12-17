@@ -15,11 +15,11 @@
 #include <linux/init.h>
 #include <linux/errno.h>
 #include <linux/delay.h>
-#include <linux/device.h>
 #include <linux/jiffies.h>
 #include <linux/smp.h>
 #include <linux/io.h>
 #include <linux/of_address.h>
+#include <linux/soc/samsung/exynos-regs-pmu.h>
 
 #include <asm/cacheflush.h>
 #include <asm/cp15.h>
@@ -30,7 +30,6 @@
 #include <mach/map.h>
 
 #include "common.h"
-#include "regs-pmu.h"
 
 extern void exynos4_secondary_startup(void);
 
@@ -182,7 +181,7 @@ static inline void __iomem *cpu_boot_reg(int cpu)
 
 	boot_reg = cpu_boot_reg_base();
 	if (!boot_reg)
-		return ERR_PTR(-ENODEV);
+		return IOMEM_ERR_PTR(-ENODEV);
 	if (soc_is_exynos4412())
 		boot_reg += 4*cpu;
 	else if (soc_is_exynos5420() || soc_is_exynos5800())
@@ -265,7 +264,7 @@ int exynos_set_boot_addr(u32 core_id, unsigned long boot_addr)
 			ret = PTR_ERR(boot_reg);
 			goto fail;
 		}
-		__raw_writel(boot_addr, boot_reg);
+		writel_relaxed(boot_addr, boot_reg);
 		ret = 0;
 	}
 fail:
@@ -290,7 +289,7 @@ int exynos_get_boot_addr(u32 core_id, unsigned long *boot_addr)
 			ret = PTR_ERR(boot_reg);
 			goto fail;
 		}
-		*boot_addr = __raw_readl(boot_reg);
+		*boot_addr = readl_relaxed(boot_reg);
 		ret = 0;
 	}
 fail:
@@ -479,7 +478,7 @@ static void exynos_cpu_die(unsigned int cpu)
 }
 #endif /* CONFIG_HOTPLUG_CPU */
 
-struct smp_operations exynos_smp_ops __initdata = {
+const struct smp_operations exynos_smp_ops __initconst = {
 	.smp_init_cpus		= exynos_smp_init_cpus,
 	.smp_prepare_cpus	= exynos_smp_prepare_cpus,
 	.smp_secondary_init	= exynos_secondary_init,

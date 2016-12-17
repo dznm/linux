@@ -85,7 +85,6 @@ struct netcp_intf {
 	struct list_head	rxhook_list_head;
 	unsigned int		rx_queue_id;
 	void			*rx_fdq[KNAV_DMA_FDQ_PER_CHAN];
-	u32			rx_buffer_sizes[KNAV_DMA_FDQ_PER_CHAN];
 	struct napi_struct	rx_napi;
 	struct napi_struct	tx_napi;
 
@@ -114,7 +113,7 @@ struct netcp_intf {
 #define	NETCP_PSDATA_LEN		KNAV_DMA_NUM_PS_WORDS
 struct netcp_packet {
 	struct sk_buff		*skb;
-	u32			*epib;
+	__le32			*epib;
 	u32			*psdata;
 	unsigned int		psdata_len;
 	struct netcp_intf	*netcp;
@@ -122,7 +121,7 @@ struct netcp_packet {
 	bool			rxtstamp_complete;
 	void			*ts_context;
 
-	int	(*txtstamp_complete)(void *ctx, struct netcp_packet *pkt);
+	void (*txtstamp)(void *ctx, struct sk_buff *skb);
 };
 
 static inline u32 *netcp_push_psdata(struct netcp_packet *p_info,

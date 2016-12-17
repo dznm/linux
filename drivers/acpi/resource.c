@@ -15,10 +15,6 @@
  *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
  *  General Public License for more details.
  *
- *  You should have received a copy of the GNU General Public License along
- *  with this program; if not, write to the Free Software Foundation, Inc.,
- *  59 Temple Place, Suite 330, Boston, MA 02111-1307 USA.
- *
  * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
  */
 
@@ -27,11 +23,24 @@
 #include <linux/export.h>
 #include <linux/ioport.h>
 #include <linux/slab.h>
+#include <linux/irq.h>
 
 #ifdef CONFIG_X86
 #define valid_IRQ(i) (((i) != 0) && ((i) != 2))
+static inline bool acpi_iospace_resource_valid(struct resource *res)
+{
+	/* On X86 IO space is limited to the [0 - 64K] IO port range */
+	return res->end < 0x10003;
+}
 #else
 #define valid_IRQ(i) (true)
+/*
+ * ACPI IO descriptors on arches other than X86 contain MMIO CPU physical
+ * addresses mapping IO space in CPU physical address space, IO space
+ * resources can be placed anywhere in the 64-bit physical address space.
+ */
+static inline bool
+acpi_iospace_resource_valid(struct resource *res) { return true; }
 #endif
 
 static bool acpi_dev_resource_len_valid(u64 start, u64 end, u64 len, bool io)
@@ -123,18 +132,20 @@ bool acpi_dev_resource_memory(struct acpi_resource *ares, struct resource *res)
 EXPORT_SYMBOL_GPL(acpi_dev_resource_memory);
 
 static void acpi_dev_ioresource_flags(struct resource *res, u64 len,
-				      u8 io_decode)
+				      u8 io_decode, u8 translation_type)
 {
 	res->flags = IORESOURCE_IO;
 
 	if (!acpi_dev_resource_len_valid(res->start, res->end, len, true))
 		res->flags |= IORESOURCE_DISABLED | IORESOURCE_UNSET;
 
-	if (res->end >= 0x10003)
+	if (!acpi_iospace_resource_valid(res))
 		res->flags |= IORESOURCE_DISABLED | IORESOURCE_UNSET;
 
 	if (io_decode == ACPI_DECODE_16)
 		res->flags |= IORESOURCE_IO_16BIT_ADDR;
+	if (translation_type == ACPI_SPARSE_TRANSLATION)
+		res->flags |= IORESOURCE_IO_SPARSE;
 }
 
 static void acpi_dev_get_ioresource(struct resource *res, u64 start, u64 len,
@@ -142,7 +153,7 @@ static void acpi_dev_get_ioresource(struct resource *res, u64 start, u64 len,
 {
 	res->start = start;
 	res->end = start + len - 1;
-	acpi_dev_ioresource_flags(res, len, io_decode);
+	acpi_dev_ioresource_flags(res, len, io_decode, 0);
 }
 
 /**
@@ -235,7 +246,8 @@ static bool acpi_decode_space(struct resource_win *win,
 		acpi_dev_memresource_flags(res, len, wp);
 		break;
 	case ACPI_IO_RANGE:
-		acpi_dev_ioresource_flags(res, len, iodec);
+		acpi_dev_ioresource_flags(res, len, iodec,
+					  addr->info.io.translation_type);
 		break;
 	case ACPI_BUS_NUMBER_RANGE:
 		res->flags = IORESOURCE_BUS;
@@ -336,6 +348,31 @@ unsigned long acpi_dev_irq_flags(u8 triggering, u8 polarity, u8 shareable)
 	return flags | IORESOURCE_IRQ;
 }
 EXPORT_SYMBOL_GPL(acpi_dev_irq_flags);
+
+/**
+ * acpi_dev_get_irq_type - Determine irq type.
+ * @triggering: Triggering type as provided by ACPI.
+ * @polarity: Interrupt polarity as provided by ACPI.
+ */
+unsigned int acpi_dev_get_irq_type(int triggering, int polarity)
+{
+	switch (polarity) {
+	case ACPI_ACTIVE_LOW:
+		return triggering == ACPI_EDGE_SENSITIVE ?
+		       IRQ_TYPE_EDGE_FALLING :
+		       IRQ_TYPE_LEVEL_LOW;
+	case ACPI_ACTIVE_HIGH:
+		return triggering == ACPI_EDGE_SENSITIVE ?
+		       IRQ_TYPE_EDGE_RISING :
+		       IRQ_TYPE_LEVEL_HIGH;
+	case ACPI_ACTIVE_BOTH:
+		if (triggering == ACPI_EDGE_SENSITIVE)
+			return IRQ_TYPE_EDGE_BOTH;
+	default:
+		return IRQ_TYPE_NONE;
+	}
+}
+EXPORT_SYMBOL_GPL(acpi_dev_get_irq_type);
 
 static void acpi_dev_irqresource_disabled(struct resource *res, u32 gsi)
 {
@@ -627,3 +664,60 @@ int acpi_dev_filter_resource_type(struct acpi_resource *ares,
 	return (type & types) ? 0 : 1;
 }
 EXPORT_SYMBOL_GPL(acpi_dev_filter_resource_type);
+
+static int acpi_dev_consumes_res(struct acpi_device *adev, struct resource *res)
+{
+	struct list_head resource_list;
+	struct resource_entry *rentry;
+	int ret, found = 0;
+
+	INIT_LIST_HEAD(&resource_list);
+	ret = acpi_dev_get_resources(adev, &resource_list, NULL, NULL);
+	if (ret < 0)
+		return 0;
+
+	list_for_each_entry(rentry, &resource_list, node) {
+		if (resource_contains(rentry->res, res)) {
+			found = 1;
+			break;
+		}
+
+	}
+
+	acpi_dev_free_resource_list(&resource_list);
+	return found;
+}
+
+static acpi_status acpi_res_consumer_cb(acpi_handle handle, u32 depth,
+					 void *context, void **ret)
+{
+	struct resource *res = context;
+	struct acpi_device **consumer = (struct acpi_device **) ret;
+	struct acpi_device *adev;
+
+	if (acpi_bus_get_device(handle, &adev))
+		return AE_OK;
+
+	if (acpi_dev_consumes_res(adev, res)) {
+		*consumer = adev;
+		return AE_CTRL_TERMINATE;
+	}
+
+	return AE_OK;
+}
+
+/**
+ * acpi_resource_consumer - Find the ACPI device that consumes @res.
+ * @res: Resource to search for.
+ *
+ * Search the current resource settings (_CRS) of every ACPI device node
+ * for @res.  If we find an ACPI device whose _CRS includes @res, return
+ * it.  Otherwise, return NULL.
+ */
+struct acpi_device *acpi_resource_consumer(struct resource *res)
+{
+	struct acpi_device *consumer = NULL;
+
+	acpi_get_devices(NULL, acpi_res_consumer_cb, res, (void **) &consumer);
+	return consumer;
+}

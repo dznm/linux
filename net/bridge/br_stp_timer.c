@@ -98,7 +98,6 @@ static void br_forward_delay_timer_expired(unsigned long arg)
 			br_topology_change_detection(br);
 		netif_carrier_on(br->dev);
 	}
-	br_log_state(p);
 	rcu_read_lock();
 	br_ifinfo_notify(RTM_NEWLINK, p);
 	rcu_read_unlock();
@@ -126,7 +125,7 @@ static void br_topology_change_timer_expired(unsigned long arg)
 	br_debug(br, "topo change timer expired\n");
 	spin_lock(&br->lock);
 	br->topology_change_detected = 0;
-	br->topology_change = 0;
+	__br_set_topology_change(br, 0);
 	spin_unlock(&br->lock);
 }
 

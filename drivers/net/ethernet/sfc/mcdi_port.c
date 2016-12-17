@@ -13,7 +13,6 @@
 
 #include <linux/slab.h>
 #include "efx.h"
-#include "phy.h"
 #include "mcdi.h"
 #include "mcdi_pcol.h"
 #include "nic.h"
@@ -189,11 +188,12 @@ static u32 mcdi_to_ethtool_cap(u32 media, u32 cap)
 
 	case MC_CMD_MEDIA_XFP:
 	case MC_CMD_MEDIA_SFP_PLUS:
-		result |= SUPPORTED_FIBRE;
-		break;
-
 	case MC_CMD_MEDIA_QSFP_PLUS:
 		result |= SUPPORTED_FIBRE;
+		if (cap & (1 << MC_CMD_PHY_CAP_1000FDX_LBN))
+			result |= SUPPORTED_1000baseT_Full;
+		if (cap & (1 << MC_CMD_PHY_CAP_10000FDX_LBN))
+			result |= SUPPORTED_10000baseT_Full;
 		if (cap & (1 << MC_CMD_PHY_CAP_40000FDX_LBN))
 			result |= SUPPORTED_40000baseCR4_Full;
 		break;
@@ -840,7 +840,7 @@ void efx_mcdi_process_link_change(struct efx_nic *efx, efx_qword_t *ev)
 	u32 flags, fcntl, speed, lpa;
 
 	speed = EFX_QWORD_FIELD(*ev, MCDI_EVENT_LINKCHANGE_SPEED);
-	EFX_BUG_ON_PARANOID(speed >= ARRAY_SIZE(efx_mcdi_event_link_speed));
+	EFX_WARN_ON_PARANOID(speed >= ARRAY_SIZE(efx_mcdi_event_link_speed));
 	speed = efx_mcdi_event_link_speed[speed];
 
 	flags = EFX_QWORD_FIELD(*ev, MCDI_EVENT_LINKCHANGE_LINK_FLAGS);

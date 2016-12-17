@@ -6,14 +6,14 @@
 /* Forward declaration, a strange C thing */
 struct task_struct;
 struct mm_struct;
+struct vm86;
 
-#include <asm/vm86.h>
 #include <asm/math_emu.h>
 #include <asm/segment.h>
 #include <asm/types.h>
-#include <asm/sigcontext.h>
+#include <uapi/asm/sigcontext.h>
 #include <asm/current.h>
-#include <asm/cpufeature.h>
+#include <asm/cpufeatures.h>
 #include <asm/page.h>
 #include <asm/pgtable_types.h>
 #include <asm/percpu.h>
@@ -24,7 +24,6 @@ struct mm_struct;
 #include <asm/fpu/types.h>
 
 #include <linux/personality.h>
-#include <linux/cpumask.h>
 #include <linux/cache.h>
 #include <linux/threads.h>
 #include <linux/math64.h>
@@ -129,13 +128,24 @@ struct cpuinfo_x86 {
 	u16			booted_cores;
 	/* Physical processor id: */
 	u16			phys_proc_id;
+	/* Logical processor id: */
+	u16			logical_proc_id;
 	/* Core id: */
 	u16			cpu_core_id;
-	/* Compute unit id */
-	u8			compute_unit_id;
 	/* Index into per_cpu list: */
 	u16			cpu_index;
 	u32			microcode;
+};
+
+struct cpuid_regs {
+	u32 eax, ebx, ecx, edx;
+};
+
+enum cpuid_regs_idx {
+	CPUID_EAX = 0,
+	CPUID_EBX,
+	CPUID_ECX,
+	CPUID_EDX,
 };
 
 #define X86_VENDOR_INTEL	0
@@ -179,6 +189,9 @@ extern void identify_secondary_cpu(struct cpuinfo_x86 *);
 extern void print_cpu_info(struct cpuinfo_x86 *);
 void print_cpu_msr(struct cpuinfo_x86 *);
 extern void init_scattered_cpuid_features(struct cpuinfo_x86 *c);
+extern u32 get_scattered_cpuid_leaf(unsigned int level,
+				    unsigned int sub_leaf,
+				    enum cpuid_regs_idx reg);
 extern unsigned int init_intel_cacheinfo(struct cpuinfo_x86 *c);
 extern void init_amd_cacheinfo(struct cpuinfo_x86 *c);
 
@@ -298,10 +311,13 @@ struct tss_struct {
 	 */
 	unsigned long		io_bitmap[IO_BITMAP_LONGS + 1];
 
+#ifdef CONFIG_X86_32
 	/*
-	 * Space for the temporary SYSENTER stack:
+	 * Space for the temporary SYSENTER stack.
 	 */
+	unsigned long		SYSENTER_stack_canary;
 	unsigned long		SYSENTER_stack[64];
+#endif
 
 } ____cacheline_aligned;
 
@@ -365,9 +381,14 @@ DECLARE_PER_CPU(struct irq_stack *, hardirq_stack);
 DECLARE_PER_CPU(struct irq_stack *, softirq_stack);
 #endif	/* X86_64 */
 
-extern unsigned int xstate_size;
+extern unsigned int fpu_kernel_xstate_size;
+extern unsigned int fpu_user_xstate_size;
 
 struct perf_event;
+
+typedef struct {
+	unsigned long		seg;
+} mm_segment_t;
 
 struct thread_struct {
 	/* Cached TLS descriptors: */
@@ -382,13 +403,20 @@ struct thread_struct {
 	unsigned short		fsindex;
 	unsigned short		gsindex;
 #endif
-#ifdef CONFIG_X86_32
-	unsigned long		ip;
-#endif
+
+	u32			status;		/* thread synchronous flags */
+
 #ifdef CONFIG_X86_64
-	unsigned long		fs;
+	unsigned long		fsbase;
+	unsigned long		gsbase;
+#else
+	/*
+	 * XXX: this could presumably be unsigned short.  Alternatively,
+	 * 32-bit kernels could be taught to use fsindex instead.
+	 */
+	unsigned long fs;
+	unsigned long gs;
 #endif
-	unsigned long		gs;
 
 	/* Save middle states of ptrace breakpoints */
 	struct perf_event	*ptrace_bps[HBP_NUM];
@@ -400,21 +428,20 @@ struct thread_struct {
 	unsigned long		cr2;
 	unsigned long		trap_nr;
 	unsigned long		error_code;
-#ifdef CONFIG_X86_32
+#ifdef CONFIG_VM86
 	/* Virtual 86 mode info */
-	struct vm86_struct __user *vm86_info;
-	unsigned long		screen_bitmap;
-	unsigned long		v86flags;
-	unsigned long		v86mask;
-	unsigned long		saved_sp0;
-	unsigned int		saved_fs;
-	unsigned int		saved_gs;
+	struct vm86		*vm86;
 #endif
 	/* IO permissions: */
 	unsigned long		*io_bitmap_ptr;
 	unsigned long		iopl;
 	/* Max allowed port in the bitmap, in bytes: */
 	unsigned		io_bitmap_max;
+
+	mm_segment_t		addr_limit;
+
+	unsigned int		sig_on_uaccess_err:1;
+	unsigned int		uaccess_err:1;	/* uaccess failed */
 
 	/* Floating point and extended processor state */
 	struct fpu		fpu;
@@ -423,6 +450,15 @@ struct thread_struct {
 	 * the end.
 	 */
 };
+
+/*
+ * Thread-synchronous status.
+ *
+ * This is different from the flags in that nobody else
+ * ever touches our thread-synchronous status, so we don't
+ * have to worry about atomic accesses.
+ */
+#define TS_COMPAT		0x0002	/* 32bit syscall active (64BIT)*/
 
 /*
  * Set IOPL bits in EFLAGS from given mask
@@ -477,7 +513,6 @@ static inline unsigned long current_top_of_stack(void)
 #include <asm/paravirt.h>
 #else
 #define __cpuid			native_cpuid
-#define paravirt_enabled()	0
 
 static inline void load_sp0(struct tss_struct *tss,
 			    struct thread_struct *thread)
@@ -487,11 +522,6 @@ static inline void load_sp0(struct tss_struct *tss,
 
 #define set_iopl_mask native_set_iopl_mask
 #endif /* CONFIG_PARAVIRT */
-
-typedef struct {
-	unsigned long		seg;
-} mm_segment_t;
-
 
 /* Free all resources held by a thread. */
 extern void release_thread(struct task_struct *);
@@ -562,17 +592,15 @@ static inline unsigned int cpuid_edx(unsigned int op)
 }
 
 /* REP NOP (PAUSE) is a good thing to insert into busy-wait loops. */
-static inline void rep_nop(void)
+static __always_inline void rep_nop(void)
 {
 	asm volatile("rep; nop" ::: "memory");
 }
 
-static inline void cpu_relax(void)
+static __always_inline void cpu_relax(void)
 {
 	rep_nop();
 }
-
-#define cpu_relax_lowlatency() cpu_relax()
 
 /* Stop speculative execution and prefetching of modified code. */
 static inline void sync_core(void)
@@ -605,10 +633,9 @@ static inline void sync_core(void)
 }
 
 extern void select_idle_routine(const struct cpuinfo_x86 *c);
-extern void init_amd_e400_c1e_mask(void);
+extern void amd_e400_c1e_apic_setup(void);
 
 extern unsigned long		boot_option_idle_override;
-extern bool			amd_e400_c1e_detected;
 
 enum idle_boot_override {IDLE_NO_OVERRIDE=0, IDLE_HALT, IDLE_NOMWAIT,
 			 IDLE_POLL};
@@ -650,14 +677,6 @@ static inline void update_debugctlmsr(unsigned long debugctlmsr)
 }
 
 extern void set_task_blockstep(struct task_struct *task, bool on);
-
-/*
- * from system description table in BIOS. Mostly for MCA use, but
- * others may find it useful:
- */
-extern unsigned int		machine_id;
-extern unsigned int		machine_submodel_id;
-extern unsigned int		BIOS_revision;
 
 /* Boot loader type from the setup header: */
 extern int			bootloader_type;
@@ -720,12 +739,10 @@ static inline void spin_lock_prefetch(const void *x)
 
 #define INIT_THREAD  {							  \
 	.sp0			= TOP_OF_INIT_STACK,			  \
-	.vm86_info		= NULL,					  \
 	.sysenter_cs		= __KERNEL_CS,				  \
 	.io_bitmap_ptr		= NULL,					  \
+	.addr_limit		= KERNEL_DS,				  \
 }
-
-extern unsigned long thread_saved_pc(struct task_struct *tsk);
 
 /*
  * TOP_OF_KERNEL_STACK_PADDING reserves 8 bytes on top of the ring0 stack.
@@ -772,20 +789,17 @@ extern unsigned long thread_saved_pc(struct task_struct *tsk);
 #define STACK_TOP		TASK_SIZE
 #define STACK_TOP_MAX		TASK_SIZE_MAX
 
-#define INIT_THREAD  { \
-	.sp0 = TOP_OF_INIT_STACK \
+#define INIT_THREAD  {						\
+	.sp0			= TOP_OF_INIT_STACK,		\
+	.addr_limit		= KERNEL_DS,			\
 }
-
-/*
- * Return saved PC of a blocked thread.
- * What is this good for? it will be always the scheduler or ret_from_fork.
- */
-#define thread_saved_pc(t)	(*(unsigned long *)((t)->thread.sp - 8))
 
 #define task_pt_regs(tsk)	((struct pt_regs *)(tsk)->thread.sp0 - 1)
 extern unsigned long KSTK_ESP(struct task_struct *task);
 
 #endif /* CONFIG_X86_64 */
+
+extern unsigned long thread_saved_pc(struct task_struct *tsk);
 
 extern void start_thread(struct pt_regs *regs, unsigned long new_ip,
 					       unsigned long new_sp);

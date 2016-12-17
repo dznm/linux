@@ -5,7 +5,7 @@
  *****************************************************************************/
 
 /*
- * Copyright (C) 2000 - 2015, Intel Corp.
+ * Copyright (C) 2000 - 2016, Intel Corp.
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -98,8 +98,8 @@ acpi_status acpi_allocate_root_table(u32 initial_table_count)
  *
  ******************************************************************************/
 
-acpi_status __init
-acpi_initialize_tables(struct acpi_table_desc * initial_table_array,
+acpi_status ACPI_INIT_FUNCTION
+acpi_initialize_tables(struct acpi_table_desc *initial_table_array,
 		       u32 initial_table_count, u8 allow_resize)
 {
 	acpi_physical_address rsdp_address;
@@ -120,7 +120,7 @@ acpi_initialize_tables(struct acpi_table_desc * initial_table_array,
 		/* Root Table Array has been statically allocated by the host */
 
 		memset(initial_table_array, 0,
-		       (acpi_size) initial_table_count *
+		       (acpi_size)initial_table_count *
 		       sizeof(struct acpi_table_desc));
 
 		acpi_gbl_root_table_list.tables = initial_table_array;
@@ -164,9 +164,10 @@ ACPI_EXPORT_SYMBOL_INIT(acpi_initialize_tables)
  *              kernel.
  *
  ******************************************************************************/
-acpi_status __init acpi_reallocate_root_table(void)
+acpi_status ACPI_INIT_FUNCTION acpi_reallocate_root_table(void)
 {
 	acpi_status status;
+	u32 i;
 
 	ACPI_FUNCTION_TRACE(acpi_reallocate_root_table);
 
@@ -176,6 +177,21 @@ acpi_status __init acpi_reallocate_root_table(void)
 	 */
 	if (acpi_gbl_root_table_list.flags & ACPI_ROOT_ORIGIN_ALLOCATED) {
 		return_ACPI_STATUS(AE_SUPPORT);
+	}
+
+	/*
+	 * Ensure OS early boot logic, which is required by some hosts. If the
+	 * table state is reported to be wrong, developers should fix the
+	 * issue by invoking acpi_put_table() for the reported table during the
+	 * early stage.
+	 */
+	for (i = 0; i < acpi_gbl_root_table_list.current_table_count; ++i) {
+		if (acpi_gbl_root_table_list.tables[i].pointer) {
+			ACPI_ERROR((AE_INFO,
+				    "Table [%4.4s] is not invalidated during early boot stage",
+				    acpi_gbl_root_table_list.tables[i].
+				    signature.ascii));
+		}
 	}
 
 	acpi_gbl_root_table_list.flags |= ACPI_ROOT_ALLOW_RESIZE;
@@ -352,7 +368,7 @@ ACPI_EXPORT_SYMBOL(acpi_get_table)
  *
  ******************************************************************************/
 acpi_status
-acpi_get_table_by_index(u32 table_index, struct acpi_table_header ** table)
+acpi_get_table_by_index(u32 table_index, struct acpi_table_header **table)
 {
 	acpi_status status;
 

@@ -482,7 +482,6 @@ static const struct net_device_ops ec_bhf_netdev_ops = {
 	.ndo_open		= ec_bhf_open,
 	.ndo_stop		= ec_bhf_stop,
 	.ndo_get_stats64	= ec_bhf_get_stats,
-	.ndo_change_mtu		= eth_change_mtu,
 	.ndo_validate_addr	= eth_validate_addr,
 	.ndo_set_mac_address	= eth_mac_addr
 };
@@ -604,19 +603,7 @@ static struct pci_driver pci_driver = {
 	.probe		= ec_bhf_probe,
 	.remove		= ec_bhf_remove,
 };
-
-static int __init ec_bhf_init(void)
-{
-	return pci_register_driver(&pci_driver);
-}
-
-static void __exit ec_bhf_exit(void)
-{
-	pci_unregister_driver(&pci_driver);
-}
-
-module_init(ec_bhf_init);
-module_exit(ec_bhf_exit);
+module_pci_driver(pci_driver);
 
 module_param(polling_frequency, long, S_IRUGO);
 MODULE_PARM_DESC(polling_frequency, "Polling timer frequency in ns");
